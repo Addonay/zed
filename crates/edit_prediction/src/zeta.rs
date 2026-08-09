@@ -6,7 +6,7 @@ use crate::{
     cursor_excerpt::{self, compute_cursor_excerpt, compute_syntax_ranges},
     data_collection::CapturedPredictionContext,
     prediction::EditPredictionResult,
-    udiff::prediction_edits_for_single_file_diff,
+    udiff::prediction_edits_for_single_file_diff_with_preferred_target,
 };
 use anyhow::{Context as _, Result};
 use cloud_llm_client::{
@@ -18,7 +18,7 @@ use language::{
     Buffer, BufferSnapshot, DiagnosticSeverity, EditPredictionPromptFormat, OffsetRangeExt as _,
     ToOffset as _, ZetaVersion, language_settings::all_language_settings, text_diff,
 };
-use project::Project;
+use project::{Project, ProjectPath};
 use release_channel::AppVersion;
 use text::{Anchor, Bias, Point};
 use ui::SharedString;
@@ -79,6 +79,9 @@ pub(crate) fn request_prediction_with_zeta(
     let open_ai_compatible_api_key = load_open_ai_compatible_api_key_if_needed(provider, cx);
 
     let excerpt_path = buffer_path_with_id_fallback(snapshot.file(), &snapshot.text, cx);
+    let excerpt_project_path = snapshot
+        .file()
+        .map(|file| ProjectPath::from_file(file.as_ref(), cx));
 
     let repo_url = repo_url.filter(|_| can_collect_data);
     let client = store.client.clone();
@@ -102,6 +105,7 @@ pub(crate) fn request_prediction_with_zeta(
         Patch {
             inputs: EditPredictionInputs,
             project: Entity<Project>,
+            project_path: Option<ProjectPath>,
             buffer: Entity<Buffer>,
             snapshot: BufferSnapshot,
             patch: String,
@@ -244,6 +248,7 @@ pub(crate) fn request_prediction_with_zeta(
                             Some(PendingPrediction::Patch {
                                 inputs,
                                 project: project_for_request,
+                                project_path: excerpt_project_path,
                                 buffer,
                                 snapshot: snapshot.clone(),
                                 patch: response.patch,
@@ -514,12 +519,27 @@ pub(crate) fn request_prediction_with_zeta(
             PendingPrediction::Patch {
                 inputs,
                 project,
+                project_path,
                 buffer: fallback_buffer,
                 snapshot: fallback_snapshot,
                 patch,
             } => {
+                let preferred_target = project_path.map(|project_path| {
+                    (
+                        project_path,
+                        fallback_buffer.clone(),
+                        fallback_snapshot.clone(),
+                    )
+                });
                 let (buffer, snapshot, edits, cursor_position) =
-                    match prediction_edits_for_single_file_diff(&patch, &project, cx).await {
+                    match prediction_edits_for_single_file_diff_with_preferred_target(
+                        &patch,
+                        &project,
+                        preferred_target,
+                        cx,
+                    )
+                    .await
+                    {
                         Ok(Some(edits)) => edits,
                         Ok(None) => {
                             return Ok(Some(

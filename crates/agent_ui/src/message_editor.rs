@@ -484,6 +484,7 @@ impl MessageEditor {
                 min_entries_visible: 12,
                 max_entries_visible: 12,
                 placement: None,
+                use_viewport_bounds_for_placement: false,
             });
             editor.register_addon(MessageEditorAddon::new());
 

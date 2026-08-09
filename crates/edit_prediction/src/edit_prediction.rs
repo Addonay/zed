@@ -1777,7 +1777,18 @@ impl EditPredictionStore {
         let file_context = new_file.as_ref().map(|file| {
             let project_path = ProjectPath::from_file(file.as_ref(), cx);
             let file_context = project_state.file_context_for_path(project_path.clone(), cx);
-            Self::ensure_git_changed_file_sets_loading(&file_context, project, &project_path, cx);
+            if file.is_private() || !file.disk_state().exists() {
+                file_context.update(cx, |file_context, _| {
+                    file_context.git_changed_file_sets = Some(Arc::default());
+                });
+            } else {
+                Self::ensure_git_changed_file_sets_loading(
+                    &file_context,
+                    project,
+                    &project_path,
+                    cx,
+                );
+            }
             file_context
         });
 

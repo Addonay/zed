@@ -16,7 +16,10 @@ use gpui::{
 use jupyter_protocol::JupyterKernelspec;
 use language::{Language, LanguageRegistry};
 use log;
-use project::{Project, ProjectEntryId, ProjectPath};
+use project::{
+    Project, ProjectEntryId, ProjectPath,
+    lsp_store::{NotebookCellDescriptor, OpenNotebookDocumentHandle},
+};
 use settings::Settings as _;
 use ui::{CommonAnimationExt, KeyBinding, Tooltip, prelude::*};
 use workspace::item::{ItemEvent, SaveOptions, TabContentParams};
@@ -103,6 +106,7 @@ pub struct NotebookEditor {
     cell_order: Vec<CellId>,
     original_cell_order: Vec<CellId>,
     cell_map: HashMap<CellId, Cell>,
+    notebook_lsp_handle: Option<OpenNotebookDocumentHandle>,
     kernel: Kernel,
     kernel_specification: Option<KernelSpecification>,
     execution_requests: HashMap<String, CellId>,
@@ -135,7 +139,14 @@ impl NotebookEditor {
             let cell = notebook_item.read(cx).notebook.cells[index].clone();
             let cell_id = cell.id();
             cell_order.push(cell_id.clone());
-            let cell_entity = Cell::load(&cell, &languages, notebook_language.clone(), window, cx);
+            let cell_entity = Cell::load(
+                &cell,
+                &languages,
+                notebook_language.clone(),
+                project.clone(),
+                window,
+                cx,
+            );
 
             match &cell_entity {
                 Cell::Code(code_cell) => {
@@ -218,6 +229,7 @@ impl NotebookEditor {
             cell_order: cell_order.clone(),
             original_cell_order: cell_order.clone(),
             cell_map: cell_map.clone(),
+            notebook_lsp_handle: None,
             kernel: Kernel::Shutdown,
             kernel_specification: None,
             execution_requests: HashMap::default(),
@@ -260,11 +272,60 @@ impl NotebookEditor {
                             });
                         }
                     }
+                    this.register_notebook_with_language_servers(language.as_ref(), cx);
                 });
             }
             language
         });
         self.notebook_language = task.shared();
+    }
+
+    fn register_notebook_with_language_servers(
+        &mut self,
+        language: Option<&Arc<Language>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(language) = language else {
+            self.notebook_lsp_handle = None;
+            return;
+        };
+        let language_id = self
+            .notebook_item
+            .read(cx)
+            .language_name()
+            .unwrap_or_else(|| language.name().to_string())
+            .to_lowercase();
+        let extension = match language_id.as_str() {
+            "python" => "py",
+            "typescript" => "ts",
+            "javascript" => "js",
+            "r" => "r",
+            other => other,
+        };
+        let cells = self
+            .cell_order
+            .iter()
+            .filter_map(|cell_id| match self.cell_map.get(cell_id) {
+                Some(Cell::Code(code_cell)) => Some(NotebookCellDescriptor::code(
+                    cell_id.as_str(),
+                    language_id.clone(),
+                    extension,
+                    code_cell.read(cx).buffer(cx),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if cells.is_empty() {
+            self.notebook_lsp_handle = None;
+            return;
+        }
+
+        self.notebook_lsp_handle = None;
+        let project_path = self.notebook_item.read(cx).project_path.clone();
+        let lsp_store = self.project.read(cx).lsp_store();
+        self.notebook_lsp_handle = lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.register_notebook_document(project_path, "jupyter-notebook".into(), cells, cx)
+        });
     }
 
     fn has_structural_changes(&self) -> bool {
@@ -748,6 +809,7 @@ impl NotebookEditor {
             self.cell_order
                 .swap(self.selected_cell_index, self.selected_cell_index - 1);
             self.selected_cell_index -= 1;
+            self.refresh_language(cx);
             cx.notify();
         }
     }
@@ -758,6 +820,7 @@ impl NotebookEditor {
             self.cell_order
                 .swap(self.selected_cell_index, self.selected_cell_index + 1);
             self.selected_cell_index += 1;
+            self.refresh_language(cx);
             cx.notify();
         }
     }
@@ -858,6 +921,7 @@ impl NotebookEditor {
                 metadata,
                 String::new(),
                 notebook_language,
+                self.project.clone(),
                 window,
                 cx,
             )
@@ -884,6 +948,7 @@ impl NotebookEditor {
         .detach();
 
         self.insert_cell_at_current_position(new_cell_id, Cell::Code(code_cell.clone()));
+        self.refresh_language(cx);
         let editor = code_cell.read(cx).editor().clone();
         window.focus(&editor.focus_handle(cx), cx);
         self.notebook_mode = NotebookMode::Edit;
@@ -1375,23 +1440,35 @@ impl NotebookEditor {
 
         match cell {
             Cell::Code(cell) => {
-                cell.update(cx, |cell, _cx| {
+                cell.update(cx, |cell, cx| {
+                    let selection_changed = cell.selected() != is_selected;
                     cell.set_selected(is_selected)
                         .set_cell_position(cell_position);
+                    if selection_changed {
+                        cx.notify();
+                    }
                 });
                 cell.clone().into_any_element()
             }
             Cell::Markdown(cell) => {
-                cell.update(cx, |cell, _cx| {
+                cell.update(cx, |cell, cx| {
+                    let selection_changed = cell.selected() != is_selected;
                     cell.set_selected(is_selected)
                         .set_cell_position(cell_position);
+                    if selection_changed {
+                        cx.notify();
+                    }
                 });
                 cell.clone().into_any_element()
             }
             Cell::Raw(cell) => {
-                cell.update(cx, |cell, _cx| {
+                cell.update(cx, |cell, cx| {
+                    let selection_changed = cell.selected() != is_selected;
                     cell.set_selected(is_selected)
                         .set_cell_position(cell_position);
+                    if selection_changed {
+                        cx.notify();
+                    }
                 });
                 cell.clone().into_any_element()
             }
@@ -1776,7 +1853,7 @@ impl Item for NotebookEditor {
     type Event = ();
 
     fn can_split(&self) -> bool {
-        true
+        false
     }
 
     fn clone_on_split(
@@ -1868,10 +1945,17 @@ impl Item for NotebookEditor {
 
         self.mark_as_saved(cx);
 
-        cx.spawn(async move |_this, _cx| {
+        cx.spawn(async move |this, cx| {
             let json =
                 serde_json::to_string_pretty(&notebook).context("Failed to serialize notebook")?;
             fs.atomic_write(path, json).await?;
+            this.update(cx, |this, cx| {
+                if let Some(handle) = &this.notebook_lsp_handle {
+                    project.read(cx).lsp_store().update(cx, |lsp_store, cx| {
+                        lsp_store.save_notebook_document(handle, cx);
+                    });
+                }
+            })?;
             Ok(())
         })
     }
@@ -1950,16 +2034,24 @@ impl Item for NotebookEditor {
                 for cell in notebook.cells.iter() {
                     let cell_id = cell.id();
                     cell_order.push(cell_id.clone());
-                    let cell_entity =
-                        Cell::load(cell, &languages, notebook_language.clone(), window, cx);
+                    let cell_entity = Cell::load(
+                        cell,
+                        &languages,
+                        notebook_language.clone(),
+                        this.project.clone(),
+                        window,
+                        cx,
+                    );
                     cell_map.insert(cell_id.clone(), cell_entity);
                 }
 
                 this.cell_order = cell_order.clone();
                 this.original_cell_order = cell_order;
                 this.cell_map = cell_map;
+                this.notebook_lsp_handle = None;
                 this.cell_list =
                     ListState::new(this.cell_order.len(), gpui::ListAlignment::Top, px(1000.));
+                this.refresh_language(cx);
                 cx.notify();
             })?;
 

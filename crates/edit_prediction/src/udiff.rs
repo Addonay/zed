@@ -9,7 +9,7 @@ use language::{
     text_diff,
 };
 use postage::stream::Stream as _;
-use project::Project;
+use project::{Project, ProjectPath};
 use util::{paths::PathStyle, rel_path::RelPath};
 use worktree::Worktree;
 use zeta_prompt::udiff::{
@@ -49,6 +49,22 @@ pub async fn prediction_edits_for_single_file_diff(
         Option<PredictedCursorPosition>,
     )>,
 > {
+    prediction_edits_for_single_file_diff_with_preferred_target(diff_str, project, None, cx).await
+}
+
+pub(crate) async fn prediction_edits_for_single_file_diff_with_preferred_target(
+    diff_str: &str,
+    project: &Entity<Project>,
+    preferred_target: Option<(ProjectPath, Entity<Buffer>, BufferSnapshot)>,
+    cx: &mut AsyncApp,
+) -> Result<
+    Option<(
+        Entity<Buffer>,
+        BufferSnapshot,
+        Vec<(Range<Anchor>, Arc<str>)>,
+        Option<PredictedCursorPosition>,
+    )>,
+> {
     let mut diff = DiffParser::new(diff_str);
     let mut target_file = None;
     let mut edits = Vec::new();
@@ -78,10 +94,22 @@ pub async fn prediction_edits_for_single_file_diff(
                             project.find_project_path(Path::new(&path), cx)
                         })
                         .with_context(|| format!("no such path: {path}"))?;
-                    let buffer = project
-                        .update(cx, |project, cx| project.open_buffer(project_path, cx))
-                        .await?;
-                    let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+                    let preferred_buffer =
+                        preferred_target
+                            .as_ref()
+                            .and_then(|(preferred_path, buffer, snapshot)| {
+                                (preferred_path == &project_path)
+                                    .then(|| (buffer.clone(), snapshot.clone()))
+                            });
+                    let (buffer, snapshot) = if let Some(preferred_buffer) = preferred_buffer {
+                        preferred_buffer
+                    } else {
+                        let buffer = project
+                            .update(cx, |project, cx| project.open_buffer(project_path, cx))
+                            .await?;
+                        let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+                        (buffer, snapshot)
+                    };
 
                     target_file = Some((path, buffer, snapshot));
                 }
@@ -399,7 +427,7 @@ fn resolve_hunk_edits_in_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui::{AppContext as _, TestAppContext};
     use indoc::indoc;
 
     use pretty_assertions::assert_eq;
@@ -511,6 +539,49 @@ mod tests {
         buffer.read_with(cx, |buffer, _cx| {
             assert_eq!(buffer.text(), "Hola!\nComo estas?\nAdios\n");
         });
+    }
+
+    #[gpui::test]
+    async fn test_prediction_edits_for_single_file_diff_prefers_virtual_active_buffer(
+        cx: &mut TestAppContext,
+    ) {
+        let fs = init_test(cx);
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let project_path = project.update(cx, |project, cx| {
+            project
+                .find_project_path(Path::new("root/.notebook.cell-1.py"), cx)
+                .unwrap()
+        });
+        let virtual_buffer = cx.new(|cx| Buffer::local("import polars as pl\npl.sele\n", cx));
+        let virtual_snapshot = virtual_buffer.read_with(cx, |buffer, _| buffer.snapshot());
+        let diff = indoc! {r#"
+            --- a/root/.notebook.cell-1.py
+            +++ b/root/.notebook.cell-1.py
+            @@ -1,2 +1,2 @@
+             import polars as pl
+            -pl.sele
+            +pl.select()
+        "#};
+
+        let (buffer, _, edits, cursor_position) =
+            prediction_edits_for_single_file_diff_with_preferred_target(
+                diff,
+                &project,
+                Some((project_path, virtual_buffer.clone(), virtual_snapshot)),
+                &mut cx.to_async(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(cursor_position.is_none());
+        assert_eq!(buffer.entity_id(), virtual_buffer.entity_id());
+        buffer.update(cx, |buffer, cx| buffer.edit(edits, None, cx));
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "import polars as pl\npl.select()\n"
+        );
     }
 
     #[gpui::test]

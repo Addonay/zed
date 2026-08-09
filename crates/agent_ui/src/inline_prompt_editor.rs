@@ -1269,6 +1269,7 @@ impl PromptEditor<BufferCodegen> {
                 min_entries_visible: 12,
                 max_entries_visible: 12,
                 placement: None,
+                use_viewport_bounds_for_placement: false,
             });
 
             editor
@@ -1419,6 +1420,7 @@ impl PromptEditor<TerminalCodegen> {
                 min_entries_visible: 12,
                 max_entries_visible: 12,
                 placement: None,
+                use_viewport_bounds_for_placement: false,
             });
             editor
         });

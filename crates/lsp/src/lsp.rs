@@ -1,4 +1,5 @@
 mod input_handler;
+pub mod notebook;
 
 pub use lsp_types::request::*;
 pub use lsp_types::*;
@@ -122,6 +123,7 @@ pub struct LanguageServer {
     process_name: Arc<str>,
     binary: LanguageServerBinary,
     capabilities: RwLock<ServerCapabilities>,
+    notebook_document_sync: RwLock<Option<notebook::NotebookDocumentSyncOptions>>,
     /// Configuration sent to the server, stored for display in the language server logs
     /// buffer. This is represented as the message sent to the LSP in order to avoid cloning it (can
     /// be large in cases like sending schemas to the json server).
@@ -626,6 +628,7 @@ impl LanguageServer {
                 .unwrap_or_default(),
             binary,
             capabilities: Default::default(),
+            notebook_document_sync: Default::default(),
             configuration,
             code_action_kinds,
             next_id: Default::default(),
@@ -1084,8 +1087,10 @@ impl LanguageServer {
         cx: &App,
     ) -> Task<Result<Arc<Self>>> {
         cx.background_spawn(async move {
+            let params = notebook::initialize_params_with_notebook_support(params)
+                .context("serializing language server initialize parameters")?;
             let response = self
-                .request::<request::Initialize>(params, timeout)
+                .request::<notebook::Initialize>(params, timeout)
                 .await
                 .into_response()
                 .with_context(|| {
@@ -1099,7 +1104,17 @@ impl LanguageServer {
                 self.version = info.version.map(SharedString::from);
                 self.process_name = info.name.into();
             }
-            self.capabilities = RwLock::new(response.capabilities);
+            let notebook_document_sync = response
+                .capabilities
+                .get("notebookDocumentSync")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .context("parsing notebookDocumentSync server capability")?;
+            let capabilities = serde_json::from_value(response.capabilities)
+                .context("parsing language server capabilities")?;
+            self.capabilities = RwLock::new(capabilities);
+            self.notebook_document_sync = RwLock::new(notebook_document_sync);
             self.configuration = configuration;
 
             self.notify::<notification::Initialized>(InitializedParams {})?;
@@ -1113,14 +1128,12 @@ impl LanguageServer {
 
         let response_handlers = self.response_handlers.clone();
         let next_id = AtomicI32::new(self.next_id.load(SeqCst));
-        let outbound_tx = self.outbound_tx.clone();
         let executor = self.executor.clone();
         let notification_serializers = self.notification_tx.clone();
         let mut output_done = self.output_done_rx.lock().take().unwrap();
         let shutdown_request = Self::request_internal::<request::Shutdown>(
             &next_id,
             &response_handlers,
-            &outbound_tx,
             &notification_serializers,
             &executor,
             SERVER_SHUTDOWN_TIMEOUT,
@@ -1367,6 +1380,21 @@ impl LanguageServer {
         self.capabilities.read().clone()
     }
 
+    /// Get the notebook document synchronization capability reported by the
+    /// running language server.
+    pub fn notebook_document_sync(&self) -> Option<notebook::NotebookDocumentSyncOptions> {
+        self.notebook_document_sync.read().clone()
+    }
+
+    /// Return whether this server accepts the given notebook and cell
+    /// languages through LSP 3.17 notebook document synchronization.
+    pub fn supports_notebook(&self, notebook_type: &str, cell_languages: &[String]) -> bool {
+        self.notebook_document_sync
+            .read()
+            .as_ref()
+            .is_some_and(|options| options.supports(notebook_type, cell_languages))
+    }
+
     /// Get the reported capabilities of the running language server and
     /// what we know on the client/adapter-side of its capabilities.
     pub fn adapter_server_capabilities(&self) -> AdapterServerCapabilities {
@@ -1416,7 +1444,6 @@ impl LanguageServer {
         Self::request_internal::<T>(
             &self.next_id,
             &self.response_handlers,
-            &self.outbound_tx,
             &self.notification_tx,
             &self.executor,
             request_timeout,
@@ -1439,7 +1466,6 @@ impl LanguageServer {
         Self::request_internal_with_timer::<T, U>(
             &self.next_id,
             &self.response_handlers,
-            &self.outbound_tx,
             &self.notification_tx,
             &self.executor,
             timer,
@@ -1450,7 +1476,6 @@ impl LanguageServer {
     fn request_internal_with_timer<T, U>(
         next_id: &AtomicI32,
         response_handlers: &Arc<Mutex<Option<HashMap<RequestId, ResponseHandler>>>>,
-        outbound_tx: &async_channel::Sender<String>,
         notification_serializers: &async_channel::Sender<NotificationSerializer>,
         executor: &BackgroundExecutor,
         timer: U,
@@ -1498,12 +1523,12 @@ impl LanguageServer {
                 );
             });
 
-        let send = outbound_tx
-            .try_send(message)
-            .context("failed to write to language server's stdin");
+        let send = notification_serializers
+            .send_blocking(NotificationSerializer(Box::new(move || message)))
+            .context("failed to queue language server request");
+        let notification_serializers = notification_serializers.downgrade();
 
         let response_handlers = Arc::clone(response_handlers);
-        let notification_serializers = notification_serializers.downgrade();
         let started = Instant::now();
         LspRequest::new(id, async move {
             if let Err(e) = handle_response {
@@ -1560,7 +1585,6 @@ impl LanguageServer {
     fn request_internal<T>(
         next_id: &AtomicI32,
         response_handlers: &Arc<Mutex<Option<HashMap<RequestId, ResponseHandler>>>>,
-        outbound_tx: &async_channel::Sender<String>,
         notification_serializers: &async_channel::Sender<NotificationSerializer>,
         executor: &BackgroundExecutor,
         request_timeout: Duration,
@@ -1573,7 +1597,6 @@ impl LanguageServer {
         Self::request_internal_with_timer::<T, _>(
             next_id,
             response_handlers,
-            outbound_tx,
             notification_serializers,
             executor,
             Self::request_timeout_future(executor.clone(), request_timeout),
@@ -1849,6 +1872,19 @@ impl FakeLanguageServer {
         capabilities: ServerCapabilities,
         cx: &mut AsyncApp,
     ) -> (LanguageServer, FakeLanguageServer) {
+        Self::new_with_notebook_capabilities(server_id, binary, name, capabilities, None, cx)
+    }
+
+    /// Construct a fake language server that advertises LSP notebook document
+    /// synchronization in addition to its regular server capabilities.
+    pub fn new_with_notebook_capabilities(
+        server_id: LanguageServerId,
+        binary: LanguageServerBinary,
+        name: String,
+        capabilities: ServerCapabilities,
+        notebook_document_sync: Option<notebook::NotebookDocumentSyncOptions>,
+        cx: &mut AsyncApp,
+    ) -> (LanguageServer, FakeLanguageServer) {
         let (stdin_writer, stdin_reader) = async_pipe::pipe();
         let (stdout_writer, stdout_reader) = async_pipe::pipe();
         let (notifications_tx, notifications_rx) = async_channel::unbounded();
@@ -1904,13 +1940,22 @@ impl FakeLanguageServer {
             }),
             notifications_rx,
         };
-        fake.set_request_handler::<request::Initialize, _, _>({
+        fake.set_request_handler::<notebook::Initialize, _, _>({
             let capabilities = capabilities;
+            let notebook_document_sync = notebook_document_sync;
             move |_, _| {
                 let capabilities = capabilities.clone();
+                let notebook_document_sync = notebook_document_sync.clone();
                 let name = name.clone();
                 async move {
-                    Ok(InitializeResult {
+                    let mut capabilities = serde_json::to_value(capabilities).unwrap();
+                    if let Some(notebook_document_sync) = notebook_document_sync {
+                        capabilities.as_object_mut().unwrap().insert(
+                            "notebookDocumentSync".into(),
+                            serde_json::to_value(notebook_document_sync).unwrap(),
+                        );
+                    }
+                    Ok(notebook::InitializeResult {
                         capabilities,
                         server_info: Some(ServerInfo {
                             name,
@@ -2095,7 +2140,18 @@ impl FakeLanguageServer {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
-    use std::str::FromStr;
+    use std::{
+        str::FromStr,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+
+    enum NotificationOrderingRequest {}
+
+    impl request::Request for NotificationOrderingRequest {
+        type Params = ();
+        type Result = bool;
+        const METHOD: &'static str = "test/notificationOrdering";
+    }
 
     #[ctor::ctor(unsafe)]
     fn init_logger() {
@@ -2186,6 +2242,136 @@ mod tests {
         drop(server);
         cx.run_until_parked();
         fake.receive_notification::<notification::Exit>().await;
+    }
+
+    #[gpui::test]
+    async fn test_notebook_capability_initialization(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+        let notebook_sync = notebook::NotebookDocumentSyncOptions {
+            notebook_selector: vec![notebook::NotebookDocumentSyncSelector {
+                notebook: Some(notebook::NotebookSelector::Type("jupyter-notebook".into())),
+                cells: Some(vec![notebook::NotebookCellLanguage {
+                    language: "python".into(),
+                }]),
+            }],
+            save: Some(true),
+            id: None,
+        };
+        let (server, mut fake) = FakeLanguageServer::new_with_notebook_capabilities(
+            LanguageServerId(0),
+            LanguageServerBinary {
+                path: "path/to/language-server".into(),
+                arguments: vec![],
+                env: None,
+            },
+            "notebook-lsp".into(),
+            Default::default(),
+            Some(notebook_sync),
+            &mut cx.to_async(),
+        );
+        let server = cx
+            .update(|cx| {
+                let params = server.default_initialize_params(false, false, cx);
+                server.initialize(
+                    params,
+                    DidChangeConfigurationParams {
+                        settings: Value::Null,
+                    }
+                    .into(),
+                    DEFAULT_LSP_REQUEST_TIMEOUT,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        assert!(server.supports_notebook("jupyter-notebook", &["python".into()]));
+        assert!(!server.supports_notebook("jupyter-notebook", &["rust".into()]));
+
+        drop(server);
+        cx.run_until_parked();
+        fake.receive_notification::<notification::Exit>().await;
+    }
+
+    #[gpui::test]
+    async fn test_notification_precedes_following_request(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+        let (server, fake) = FakeLanguageServer::new(
+            LanguageServerId(0),
+            LanguageServerBinary {
+                path: "path/to/language-server".into(),
+                arguments: vec![],
+                env: None,
+            },
+            "ordered-lsp".into(),
+            Default::default(),
+            &mut cx.to_async(),
+        );
+        let server = cx
+            .update(|cx| {
+                let params = server.default_initialize_params(false, false, cx);
+                server.initialize(
+                    params,
+                    DidChangeConfigurationParams {
+                        settings: Value::Null,
+                    }
+                    .into(),
+                    DEFAULT_LSP_REQUEST_TIMEOUT,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let notebook_was_opened = Arc::new(AtomicBool::new(false));
+        let _notification_handled = fake
+            .handle_notification::<notebook::DidOpenNotebookDocument, _>({
+                let notebook_was_opened = notebook_was_opened.clone();
+                move |_, _| notebook_was_opened.store(true, Ordering::SeqCst)
+            });
+        let _request_handled = fake.set_request_handler::<NotificationOrderingRequest, _, _>({
+            let notebook_was_opened = notebook_was_opened.clone();
+            move |(), _| {
+                let notebook_was_opened = notebook_was_opened.load(Ordering::SeqCst);
+                async move { Ok(notebook_was_opened) }
+            }
+        });
+
+        let notebook_uri = Uri::from_str("file:///tmp/test.ipynb").unwrap();
+        let cell_uri = Uri::from_str("file:///tmp/.test.cell-one.py").unwrap();
+        server
+            .notify::<notebook::DidOpenNotebookDocument>(notebook::DidOpenNotebookDocumentParams {
+                notebook_document: notebook::NotebookDocument {
+                    uri: notebook_uri,
+                    notebook_type: "jupyter-notebook".into(),
+                    version: 0,
+                    metadata: None,
+                    cells: vec![notebook::NotebookCell {
+                        kind: notebook::NotebookCellKind::CODE,
+                        document: cell_uri.clone(),
+                        metadata: None,
+                        execution_summary: None,
+                    }],
+                },
+                cell_text_documents: vec![TextDocumentItem::new(
+                    cell_uri,
+                    "python".into(),
+                    0,
+                    "value = 1".into(),
+                )],
+            })
+            .unwrap();
+
+        let opened_before_request = server
+            .request::<NotificationOrderingRequest>((), DEFAULT_LSP_REQUEST_TIMEOUT)
+            .await
+            .into_response()
+            .unwrap();
+        assert!(opened_before_request);
     }
 
     #[gpui::test]

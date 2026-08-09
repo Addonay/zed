@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use editor::{Editor, EditorMode, MultiBuffer, SizingBehavior};
+use editor::{ContextMenuOptions, Editor, EditorMode, MultiBuffer, SizingBehavior};
 use futures::future::Shared;
 use gpui::{
     App, Entity, EventEmitter, Focusable, Hsla, InteractiveElement, RetainAllImageCache,
@@ -180,6 +180,7 @@ impl Cell {
         cell: &nbformat::v4::Cell,
         languages: &Arc<LanguageRegistry>,
         notebook_language: Shared<Task<Option<Arc<Language>>>>,
+        project: Entity<project::Project>,
         window: &mut Window,
         cx: &mut App,
     ) -> Self {
@@ -225,6 +226,7 @@ impl Cell {
                         metadata.clone(),
                         text,
                         notebook_language,
+                        project,
                         window,
                         cx,
                     )
@@ -691,6 +693,7 @@ impl CodeCell {
         metadata: CellMetadata,
         source: String,
         notebook_language: Shared<Task<Option<Arc<Language>>>>,
+        project: Entity<project::Project>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -705,7 +708,7 @@ impl CodeCell {
                     sizing_behavior: SizingBehavior::SizeByContent,
                 },
                 multi_buffer,
-                None,
+                Some(project),
                 window,
                 cx,
             );
@@ -715,6 +718,16 @@ impl CodeCell {
             editor.set_text(source.clone(), window, cx);
             editor.set_show_gutter(false, cx);
             editor.set_use_modal_editing(true);
+            // Size-by-content editors only expose the cell's own (usually
+            // short) text bounds to popup layout. Reserve a useful amount of
+            // viewport space so notebook completions do not collapse to the
+            // generic three-row fallback.
+            editor.set_context_menu_options(ContextMenuOptions {
+                min_entries_visible: 8,
+                max_entries_visible: 12,
+                placement: None,
+                use_viewport_bounds_for_placement: true,
+            });
             editor
         });
 
@@ -757,6 +770,15 @@ impl CodeCell {
 
     pub fn editor(&self) -> &Entity<editor::Editor> {
         &self.editor
+    }
+
+    pub fn buffer(&self, cx: &App) -> Entity<Buffer> {
+        self.editor
+            .read(cx)
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .expect("code cells always use singleton buffers")
     }
 
     pub fn current_source(&self, cx: &App) -> String {
@@ -1068,6 +1090,7 @@ impl RunnableCell for CodeCell {
 
 impl Render for CodeCell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_selected = self.selected();
         let output_max_height = ReplSettings::get_global(cx).output_max_height_lines;
         let output_max_height = if output_max_height > 0 {
             Some(window.line_height() * output_max_height as f32)
@@ -1098,7 +1121,6 @@ impl Render for CodeCell {
                     .rounded_xs()
                     .items_start()
                     .gap(DynamicSpacing::Base08.rems(cx))
-                    .bg(self.selected_bg_color(window, cx))
                     .child(self.gutter(window, cx))
                     .child(
                         div().py_1p5().w_full().child(
@@ -1111,7 +1133,12 @@ impl Render for CodeCell {
                                 .px_5()
                                 .rounded_lg()
                                 .border_1()
-                                .border_color(cx.theme().colors().border)
+                                .when(is_selected, |this| {
+                                    this.border_color(gpui::hsla(180.0 / 360.0, 1.0, 0.4, 1.0))
+                                })
+                                .when(!is_selected, |this| {
+                                    this.border_color(cx.theme().colors().border)
+                                })
                                 .bg(cx.theme().colors().editor_background)
                                 .child(div().w_full().child(self.editor.clone()))
                                 // lang badge in top-right corner
@@ -1145,7 +1172,6 @@ impl Render for CodeCell {
                             .rounded_xs()
                             .items_start()
                             .gap(DynamicSpacing::Base08.rems(cx))
-                            .bg(self.selected_bg_color(window, cx))
                             .child(self.gutter_output(window, cx))
                             .child(
                                 div().py_1p5().w_full().child(

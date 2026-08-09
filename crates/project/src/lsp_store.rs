@@ -20,6 +20,7 @@ mod inlay_hints;
 pub mod json_language_server_ext;
 pub mod log_store;
 pub mod lsp_ext_command;
+mod notebook;
 pub mod rust_analyzer_ext;
 mod semantic_tokens;
 pub mod vue_language_server_ext;
@@ -30,6 +31,7 @@ use self::document_links::DocumentLinksData;
 use self::document_symbols::DocumentSymbolsData;
 use self::dynamic_registration::{DynamicRegistrations, RegistrationSource};
 use self::inlay_hints::BufferInlayHints;
+pub use self::notebook::{NotebookCellDescriptor, OpenNotebookDocumentHandle};
 use crate::{
     CodeAction, Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource,
     CoreCompletion, Hover, InlayHint, InlayId, LocationLink, LspAction, LspPullDiagnostics,
@@ -333,6 +335,9 @@ pub struct LocalLspStore {
     lsp_tree: LanguageServerTree,
     registered_buffers: HashMap<BufferId, usize>,
     buffers_opened_in_servers: HashMap<BufferId, HashSet<LanguageServerId>>,
+    notebook_documents: HashMap<Uri, notebook::RegisteredNotebook>,
+    notebook_cells: HashMap<BufferId, Uri>,
+    next_notebook_registration_id: u64,
     buffer_pull_diagnostics_result_ids: HashMap<
         LanguageServerId,
         HashMap<Option<SharedString>, HashMap<PathBuf, Option<SharedString>>>,
@@ -361,6 +366,58 @@ impl LocalLspStore {
         match language_server_state {
             LanguageServerState::Running { server, .. } => Some(server),
             LanguageServerState::Starting { .. } => None,
+        }
+    }
+
+    fn notebook_buffer_for_abs_path(&self, abs_path: &Path) -> Option<Entity<Buffer>> {
+        self.notebook_documents
+            .values()
+            .flat_map(|notebook| &notebook.cells)
+            .find_map(|cell| {
+                (cell.uri.to_file_path().ok().as_deref() == Some(abs_path))
+                    .then(|| cell.buffer.clone())
+            })
+    }
+
+    fn notebook_cell_is_open_in_server(
+        &self,
+        buffer_id: BufferId,
+        server_id: LanguageServerId,
+    ) -> bool {
+        self.notebook_cells
+            .get(&buffer_id)
+            .and_then(|notebook_uri| self.notebook_documents.get(notebook_uri))
+            .is_some_and(|notebook| notebook.opened_in_servers.contains(&server_id))
+    }
+
+    /// Record the source of every cell at a notebook document version.
+    ///
+    /// Notebook-aware servers may attach the notebook document's version to
+    /// diagnostics for every cell, including cells whose text did not change.
+    /// Keeping aliases at that version lets the regular diagnostic conversion
+    /// pipeline resolve those responses without treating unchanged cells as
+    /// missing snapshots.
+    fn record_notebook_snapshots(
+        &mut self,
+        cells: &[Entity<Buffer>],
+        server_id: LanguageServerId,
+        version: i32,
+        cx: &App,
+    ) {
+        for cell in cells {
+            let cell = cell.read(cx);
+            let snapshots = self
+                .buffer_snapshots
+                .entry(cell.remote_id())
+                .or_default()
+                .entry(server_id)
+                .or_default();
+            let snapshot = cell.text_snapshot();
+            match snapshots.last_mut() {
+                Some(last) if last.version == version => last.snapshot = snapshot,
+                Some(last) if last.version > version => {}
+                _ => snapshots.push(LspBufferSnapshot { version, snapshot }),
+            }
         }
     }
 
@@ -3035,6 +3092,12 @@ impl LocalLspStore {
                 );
             });
 
+            if let Some(notebook_uri) = self.notebook_cells.get(&buffer_id).cloned()
+                && self.open_notebook_in_server(&notebook_uri, &server, &adapter, cx)
+            {
+                continue;
+            }
+
             let snapshot = LspBufferSnapshot {
                 version: 0,
                 snapshot: initial_snapshot.clone(),
@@ -3072,6 +3135,202 @@ impl LocalLspStore {
                         },
                     ),
                 });
+            }
+        }
+    }
+
+    /// Opens the complete notebook in `server` once, even though registration
+    /// is initiated independently by each cell editor.
+    fn open_notebook_in_server(
+        &mut self,
+        notebook_uri: &Uri,
+        server: &Arc<LanguageServer>,
+        adapter: &Arc<CachedLspAdapter>,
+        cx: &mut Context<LspStore>,
+    ) -> bool {
+        let Some(notebook) = self.notebook_documents.get(notebook_uri).cloned() else {
+            return false;
+        };
+        if !notebook.cells.iter().any(|cell| {
+            cell.buffer.read_with(cx, |buffer, _cx| {
+                buffer.language().is_some_and(|language| {
+                    self.languages
+                        .lsp_adapters(&language.name())
+                        .iter()
+                        .any(|candidate| candidate.name == adapter.name)
+                })
+            })
+        }) {
+            return false;
+        }
+        if !server.supports_notebook(&notebook.notebook_type, &notebook.cell_languages()) {
+            return false;
+        }
+        if notebook.opened_in_servers.contains(&server.server_id()) {
+            return true;
+        }
+
+        let mut notebook_cells = Vec::with_capacity(notebook.cells.len());
+        let mut cell_text_documents = Vec::with_capacity(notebook.cells.len());
+        for cell in &notebook.cells {
+            let buffer = cell.buffer.read(cx);
+            let snapshot = buffer.text_snapshot();
+            self.buffer_snapshots
+                .entry(buffer.remote_id())
+                .or_default()
+                .entry(server.server_id())
+                .or_insert_with(|| {
+                    vec![LspBufferSnapshot {
+                        version: 0,
+                        snapshot: snapshot.clone(),
+                    }]
+                });
+            self.buffers_opened_in_servers
+                .entry(buffer.remote_id())
+                .or_default()
+                .insert(server.server_id());
+            notebook_cells.push(lsp::notebook::NotebookCell {
+                kind: cell.kind,
+                document: cell.uri.clone(),
+                metadata: None,
+                execution_summary: None,
+            });
+            cell_text_documents.push(lsp::TextDocumentItem::new(
+                cell.uri.clone(),
+                cell.language_id.clone(),
+                0,
+                snapshot.text(),
+            ));
+            cell.buffer.update(cx, |buffer, cx| {
+                buffer.set_completion_triggers(
+                    server.server_id(),
+                    server
+                        .capabilities()
+                        .completion_provider
+                        .as_ref()
+                        .and_then(|provider| provider.trigger_characters.as_ref())
+                        .map(|characters| characters.iter().cloned().collect())
+                        .unwrap_or_default(),
+                    cx,
+                );
+            });
+        }
+        if let Err(error) = server.notify::<lsp::notebook::DidOpenNotebookDocument>(
+            lsp::notebook::DidOpenNotebookDocumentParams {
+                notebook_document: lsp::notebook::NotebookDocument {
+                    uri: notebook.uri.clone(),
+                    notebook_type: notebook.notebook_type,
+                    version: notebook.version,
+                    metadata: None,
+                    cells: notebook_cells,
+                },
+                cell_text_documents,
+            },
+        ) {
+            for cell in &notebook.cells {
+                let buffer_id = cell.buffer.read(cx).remote_id();
+                if let Some(snapshots) = self.buffer_snapshots.get_mut(&buffer_id) {
+                    snapshots.remove(&server.server_id());
+                }
+                if let Some(opened_in_servers) = self.buffers_opened_in_servers.get_mut(&buffer_id)
+                {
+                    opened_in_servers.remove(&server.server_id());
+                }
+            }
+            log::warn!(
+                "failed to open notebook {} in language server {}: {error:#}",
+                notebook_uri.as_str(),
+                server.name()
+            );
+            return false;
+        }
+        self.notebook_documents
+            .get_mut(notebook_uri)
+            .unwrap()
+            .opened_in_servers
+            .insert(server.server_id());
+        log::info!(
+            "[notebook::lsp] opened notebook {} with {} cells in language server {} ({})",
+            notebook_uri.as_str(),
+            notebook.cells.len(),
+            server.name(),
+            adapter.name()
+        );
+        true
+    }
+
+    /// Registers notebook cells as ordinary text documents for servers that do
+    /// not implement LSP notebook synchronization. This also covers servers
+    /// that start after the notebook editor has already been constructed.
+    fn open_notebook_cells_as_text_documents(
+        &mut self,
+        notebook_uri: &Uri,
+        server: &Arc<LanguageServer>,
+        adapter: &Arc<CachedLspAdapter>,
+        cx: &mut Context<LspStore>,
+    ) {
+        let Some(notebook) = self.notebook_documents.get(notebook_uri).cloned() else {
+            return;
+        };
+
+        for cell in notebook.cells {
+            let buffer = cell.buffer.read(cx);
+            let Some(language) = buffer.language().cloned() else {
+                continue;
+            };
+            if !self
+                .languages
+                .lsp_adapters(&language.name())
+                .iter()
+                .any(|candidate| candidate.name == adapter.name)
+            {
+                continue;
+            }
+
+            let buffer_id = buffer.remote_id();
+            let initial_snapshot = buffer.text_snapshot();
+            let mut registered = false;
+            self.buffer_snapshots
+                .entry(buffer_id)
+                .or_default()
+                .entry(server.server_id())
+                .or_insert_with(|| {
+                    registered = true;
+                    server.register_buffer(
+                        cell.uri.clone(),
+                        adapter.language_id(&language.name()),
+                        0,
+                        initial_snapshot.text(),
+                    );
+                    vec![LspBufferSnapshot {
+                        version: 0,
+                        snapshot: initial_snapshot,
+                    }]
+                });
+            self.buffers_opened_in_servers
+                .entry(buffer_id)
+                .or_default()
+                .insert(server.server_id());
+            cell.buffer.update(cx, |buffer, cx| {
+                buffer.set_completion_triggers(
+                    server.server_id(),
+                    server
+                        .capabilities()
+                        .completion_provider
+                        .as_ref()
+                        .and_then(|provider| provider.trigger_characters.as_ref())
+                        .map(|characters| characters.iter().cloned().collect())
+                        .unwrap_or_default(),
+                    cx,
+                );
+            });
+
+            if registered {
+                log::info!(
+                    "[notebook::lsp] opened notebook cell {} as a text document in language server {}",
+                    cell.uri.as_str(),
+                    server.name()
+                );
             }
         }
     }
@@ -3184,13 +3443,14 @@ impl LocalLspStore {
 
         if let Some(version) = version {
             let buffer_id = buffer.read(cx).remote_id();
+            let is_notebook_cell = self.notebook_cell_is_open_in_server(buffer_id, server_id);
             let snapshots = if let Some(snapshots) = self
                 .buffer_snapshots
                 .get_mut(&buffer_id)
                 .and_then(|m| m.get_mut(&server_id))
             {
                 snapshots
-            } else if version == 0 {
+            } else if version == 0 || is_notebook_cell {
                 // Some language servers report version 0 even if the buffer hasn't been opened yet.
                 // We detect this case and treat it as if the version was `None`.
                 return Ok(buffer.read(cx).text_snapshot());
@@ -3199,11 +3459,24 @@ impl LocalLspStore {
             };
 
             let found_snapshot = snapshots
-                    .binary_search_by_key(&version, |e| e.version)
-                    .map(|ix| snapshots[ix].snapshot.clone())
-                    .map_err(|_| {
-                        anyhow!("snapshot not found for buffer {buffer_id} server {server_id} at version {version}")
-                    })?;
+                .binary_search_by_key(&version, |e| e.version)
+                .map(|ix| snapshots[ix].snapshot.clone())
+                .or_else(|_| {
+                    // Notebook diagnostics are versioned against the notebook
+                    // lifecycle by some servers (including ty), rather than
+                    // each cell's independently edited text document. The
+                    // latest cell snapshot is the matching source in that
+                    // case.
+                    is_notebook_cell
+                        .then(|| snapshots.last().map(|entry| entry.snapshot.clone()))
+                        .flatten()
+                        .ok_or(())
+                })
+                .map_err(|_| {
+                    anyhow!(
+                        "snapshot not found for buffer {buffer_id} server {server_id} at version {version}"
+                    )
+                })?;
 
             snapshots.retain(|snapshot| snapshot.version + OLD_VERSIONS_TO_RETAIN >= version);
             Ok(found_snapshot)
@@ -4599,6 +4872,9 @@ impl LspStore {
                 toolchain_store,
                 registered_buffers: HashMap::default(),
                 buffers_opened_in_servers: HashMap::default(),
+                notebook_documents: HashMap::default(),
+                notebook_cells: HashMap::default(),
+                next_notebook_registration_id: 0,
                 buffer_pull_diagnostics_result_ids: HashMap::default(),
                 workspace_pull_diagnostics_result_ids: HashMap::default(),
                 restricted_worktrees_tasks: HashMap::default(),
@@ -4907,6 +5183,13 @@ impl LspStore {
         let buffer_id = buffer.read(cx).remote_id();
         let handle = OpenLspBufferHandle(cx.new(|_| OpenLspBuffer(buffer.clone())));
         if let Some(local) = self.as_local_mut() {
+            // Notebook cell lifetimes are owned by one notebook protocol
+            // handle. Cell editors still ask to register their visible
+            // singleton buffer; treating that as a second ordinary document
+            // refcount would make structural refreshes close the wrong URI.
+            if local.notebook_cells.contains_key(&buffer_id) {
+                return handle;
+            }
             let refcount = local.registered_buffers.entry(buffer_id).or_insert(0);
             if !ignore_refcounts {
                 *refcount += 1;
@@ -7612,9 +7895,23 @@ impl LspStore {
                     .map(|(_, server)| server.clone())
                     .collect::<Vec<_>>()
             });
+            let notebook_servers = self
+                .as_local()
+                .and_then(|local| {
+                    let notebook_uri = local.notebook_cells.get(&buffer_id)?;
+                    Some(
+                        local
+                            .notebook_documents
+                            .get(notebook_uri)?
+                            .opened_in_servers
+                            .clone(),
+                    )
+                })
+                .unwrap_or_default();
 
             let pull_diagnostics = servers
                 .into_iter()
+                .filter(|server| !notebook_servers.contains(&server.server_id()))
                 .flat_map(|server| {
                     let result = maybe!({
                         let local = self.as_local()?;
@@ -8553,6 +8850,27 @@ impl LspStore {
             .with_context(|| format!("Failed to convert path to URI: {}", abs_path.display()))
             .log_err()?;
         let next_snapshot = buffer.text_snapshot();
+        let notebook_change = {
+            let local = self.as_local_mut()?;
+            local
+                .notebook_cells
+                .get(&buffer.remote_id())
+                .cloned()
+                .and_then(|notebook_uri| {
+                    let notebook = local.notebook_documents.get_mut(&notebook_uri)?;
+                    notebook.version += 1;
+                    Some((
+                        notebook_uri,
+                        notebook.version,
+                        notebook.opened_in_servers.clone(),
+                        notebook
+                            .cells
+                            .iter()
+                            .map(|cell| cell.buffer.clone())
+                            .collect::<Vec<_>>(),
+                    ))
+                })
+        };
         for language_server in language_servers {
             let language_server = language_server.clone();
 
@@ -8617,23 +8935,68 @@ impl LspStore {
                 }
             };
 
-            let next_version = previous_snapshot.version + 1;
+            let notebook_server_version =
+                notebook_change
+                    .as_ref()
+                    .and_then(|(_, notebook_version, opened_in_servers, _)| {
+                        opened_in_servers
+                            .contains(&language_server.server_id())
+                            .then_some(*notebook_version)
+                    });
+            let next_version = notebook_server_version.unwrap_or(previous_snapshot.version + 1);
             buffer_snapshots.push(LspBufferSnapshot {
                 version: next_version,
                 snapshot: next_snapshot.clone(),
             });
 
-            language_server
-                .notify::<lsp::notification::DidChangeTextDocument>(
-                    lsp::DidChangeTextDocumentParams {
-                        text_document: lsp::VersionedTextDocumentIdentifier::new(
-                            uri.clone(),
-                            next_version,
-                        ),
-                        content_changes,
-                    },
-                )
-                .ok();
+            if let Some((notebook_uri, notebook_version, opened_in_servers, cells)) =
+                &notebook_change
+                && opened_in_servers.contains(&language_server.server_id())
+            {
+                self.as_local_mut()?.record_notebook_snapshots(
+                    cells,
+                    language_server.server_id(),
+                    *notebook_version,
+                    cx,
+                );
+                language_server
+                    .notify::<lsp::notebook::DidChangeNotebookDocument>(
+                        lsp::notebook::DidChangeNotebookDocumentParams {
+                            notebook_document: lsp::notebook::VersionedNotebookDocumentIdentifier {
+                                uri: notebook_uri.clone(),
+                                version: *notebook_version,
+                            },
+                            change: lsp::notebook::NotebookDocumentChangeEvent {
+                                cells: Some(lsp::notebook::NotebookDocumentCellChanges {
+                                    text_content: Some(vec![
+                                        lsp::notebook::NotebookDocumentCellContentChanges {
+                                            document: lsp::VersionedTextDocumentIdentifier::new(
+                                                uri.clone(),
+                                                next_version,
+                                            ),
+                                            changes: content_changes,
+                                        },
+                                    ]),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            },
+                        },
+                    )
+                    .ok();
+            } else {
+                language_server
+                    .notify::<lsp::notification::DidChangeTextDocument>(
+                        lsp::DidChangeTextDocumentParams {
+                            text_document: lsp::VersionedTextDocumentIdentifier::new(
+                                uri.clone(),
+                                next_version,
+                            ),
+                            content_changes,
+                        },
+                    )
+                    .ok();
+            }
             self.pull_workspace_diagnostics(language_server.server_id());
         }
 
@@ -8645,6 +9008,13 @@ impl LspStore {
         buffer: Entity<Buffer>,
         cx: &mut Context<Self>,
     ) -> Option<()> {
+        if self.as_local().is_some_and(|local| {
+            local
+                .notebook_cells
+                .contains_key(&buffer.read(cx).remote_id())
+        }) {
+            return Some(());
+        }
         let file = File::from_dyn(buffer.read(cx).file())?;
         let worktree_id = file.worktree_id(cx);
         let abs_path = file.as_local()?.abs_path(cx);
@@ -9092,7 +9462,15 @@ impl LspStore {
 
             let document_uri = lsp::Uri::from_file_path(abs_path)
                 .map_err(|()| anyhow!("Failed to convert buffer path {abs_path:?} to lsp Uri"))?;
-            if let Some(buffer_handle) = self.buffer_store.read(cx).get_by_path(&project_path) {
+            let buffer_handle = self
+                .buffer_store
+                .read(cx)
+                .get_by_path(&project_path)
+                .or_else(|| {
+                    self.as_local()
+                        .and_then(|local| local.notebook_buffer_for_abs_path(abs_path))
+                });
+            if let Some(buffer_handle) = buffer_handle {
                 let snapshot = buffer_handle.read(cx).snapshot();
                 let buffer = buffer_handle.read(cx);
                 let reused_diagnostics = buffer
@@ -9331,6 +9709,13 @@ impl LspStore {
         language_server_id: LanguageServerId,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Buffer>>> {
+        if let Ok(notebook_cell_path) = abs_path.to_file_path()
+            && let Some(buffer) = self
+                .as_local()
+                .and_then(|local| local.notebook_buffer_for_abs_path(&notebook_cell_path))
+        {
+            return Task::ready(Ok(buffer));
+        }
         let path_style = self.worktree_store.read(cx).path_style();
         cx.spawn(async move |lsp_store, cx| {
             // Escape percent-encoded string.
@@ -11656,6 +12041,18 @@ impl LspStore {
         local
             .language_server_ids
             .retain(|_, state| state.id != server_id);
+        let notebook_buffers = local
+            .notebook_documents
+            .values_mut()
+            .flat_map(|notebook| {
+                notebook.opened_in_servers.remove(&server_id);
+                notebook
+                    .cells
+                    .iter()
+                    .map(|cell| cell.buffer.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         self.buffer_store.update(cx, |buffer_store, cx| {
             for buffer in buffer_store.buffers() {
                 buffer.update(cx, |buffer, cx| {
@@ -11664,6 +12061,12 @@ impl LspStore {
                 });
             }
         });
+        for buffer in notebook_buffers {
+            buffer.update(cx, |buffer, cx| {
+                buffer.update_diagnostics(server_id, DiagnosticSet::new([], buffer), cx);
+                buffer.set_completion_triggers(server_id, Default::default(), cx);
+            });
+        }
 
         let mut cleared_paths: Vec<ProjectPath> = Vec::new();
         for (worktree_id, summaries) in self.diagnostic_summaries.iter_mut() {
@@ -12462,6 +12865,33 @@ impl LspStore {
                     },
                 ),
             });
+        }
+
+        // Notebook cell buffers are intentionally not inserted into the normal
+        // BufferStore. Re-open their owning notebook explicitly whenever a
+        // server starts or restarts.
+        let notebook_uris = self
+            .as_local()
+            .map(|local| local.notebook_documents.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if !notebook_uris.is_empty() {
+            log::info!(
+                "[notebook::lsp] registering {} open notebook(s) with language server {}",
+                notebook_uris.len(),
+                language_server.name()
+            );
+        }
+        if let Some(local) = self.as_local_mut() {
+            for notebook_uri in notebook_uris {
+                if !local.open_notebook_in_server(&notebook_uri, &language_server, &adapter, cx) {
+                    local.open_notebook_cells_as_text_documents(
+                        &notebook_uri,
+                        &language_server,
+                        &adapter,
+                        cx,
+                    );
+                }
+            }
         }
 
         cx.notify();

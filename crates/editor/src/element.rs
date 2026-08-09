@@ -3803,6 +3803,7 @@ impl EditorElement {
         let mut edit_prediction_popover_visible = false;
         let mut context_menu_visible = false;
         let context_menu_placement;
+        let use_viewport_bounds_for_placement;
 
         {
             let editor = self.editor.read(cx);
@@ -3831,6 +3832,10 @@ impl EditorElement {
                 .context_menu_options
                 .as_ref()
                 .and_then(|options| options.placement.clone());
+            use_viewport_bounds_for_placement = editor
+                .context_menu_options
+                .as_ref()
+                .is_some_and(|options| options.use_viewport_bounds_for_placement);
         }
 
         let visible = edit_prediction_popover_visible || context_menu_visible;
@@ -3866,13 +3871,18 @@ impl EditorElement {
 
         let min_height = height_above_menu + min_menu_height + height_below_menu;
         let max_height = height_above_menu + max_menu_height + height_below_menu;
+        let placement_bounds = if use_viewport_bounds_for_placement {
+            viewport_bounds
+        } else {
+            text_hitbox.bounds
+        };
         let (laid_out_popovers, y_flipped) = self.layout_popovers_above_or_below_line(
             target_position,
             line_height,
             min_height,
             max_height,
             context_menu_placement,
-            text_hitbox,
+            placement_bounds,
             viewport_bounds,
             window,
             cx,
@@ -4052,7 +4062,7 @@ impl EditorElement {
                 .context_menu_options
                 .as_ref()
                 .and_then(|options| options.placement.clone()),
-            text_hitbox,
+            text_hitbox.bounds,
             viewport_bounds,
             window,
             cx,
@@ -4073,7 +4083,7 @@ impl EditorElement {
         min_height: Pixels,
         max_height: Pixels,
         placement: Option<ContextMenuPlacement>,
-        text_hitbox: &Hitbox,
+        placement_bounds: Bounds<Pixels>,
         viewport_bounds: Bounds<Pixels>,
         window: &mut Window,
         cx: &mut App,
@@ -4094,8 +4104,8 @@ impl EditorElement {
         window.with_text_style(Some(text_style), |window| {
             // If the max height won't fit below and there is more space above, put it above the line.
             let bottom_y_when_flipped = target_position.y - line_height;
-            let available_above = bottom_y_when_flipped - text_hitbox.top();
-            let available_below = text_hitbox.bottom() - target_position.y;
+            let available_above = bottom_y_when_flipped - placement_bounds.top();
+            let available_below = placement_bounds.bottom() - target_position.y;
             let y_overflows_below = max_height > available_below;
             let mut y_flipped = match placement {
                 Some(ContextMenuPlacement::Above) => true,

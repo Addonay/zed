@@ -592,6 +592,13 @@ pub struct ContextMenuOptions {
     pub min_entries_visible: usize,
     pub max_entries_visible: usize,
     pub placement: Option<ContextMenuPlacement>,
+    /// Use the window viewport, rather than the editor's text hitbox, when
+    /// deciding whether the menu has more room above or below the cursor.
+    ///
+    /// This is useful for embedded, size-by-content editors whose text hitbox
+    /// is only a few lines tall even though their popovers may extend across
+    /// the containing view.
+    pub use_viewport_bounds_for_placement: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
